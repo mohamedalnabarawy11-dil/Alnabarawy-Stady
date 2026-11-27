@@ -1,9 +1,7 @@
 package com.example.ui.screens
 
 import android.graphics.Bitmap
-import android.graphics.ImageDecoder
-import android.os.Build
-import android.provider.MediaStore
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -73,6 +71,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.audio.SoundEngine
+import com.example.core.ImageUtils
 import com.example.data.ai.ExamDifficulty
 import com.example.data.ai.ExamMode
 import com.example.data.ai.ExamType
@@ -133,15 +132,11 @@ fun ExamRecitationScreen(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
-            try {
-                val bmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, uri))
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaStore.Images.Media.getBitmap(context.contentResolver, uri)
-                }
+            val bmp = ImageUtils.decodeUriToSafeBitmap(context, uri)
+            if (bmp != null) {
                 onBitmapSelected(bmp)
-            } catch (_: Exception) {
+            } else {
+                Toast.makeText(context, "Could not load selected image.", Toast.LENGTH_SHORT).show()
             }
         }
     }

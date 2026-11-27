@@ -169,11 +169,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (dao.countSubjects() == 0) {
             dao.insertSubjects(
                 listOf(
-                    SubjectPrefEntity(name = "الرياضيات / Math", difficulty = "HARD", isSelected = true),
-                    SubjectPrefEntity(name = "الفيزياء / Physics", difficulty = "HARD", isSelected = true),
-                    SubjectPrefEntity(name = "الكيمياء / Chemistry", difficulty = "MEDIUM", isSelected = true),
-                    SubjectPrefEntity(name = "اللغة العربية / Arabic", difficulty = "MEDIUM", isSelected = true),
-                    SubjectPrefEntity(name = "اللغة الإنجليزية / English", difficulty = "EASY", isSelected = true)
+                    SubjectPrefEntity(name = "الرياضيات", difficulty = "HARD", isSelected = true),
+                    SubjectPrefEntity(name = "الفيزياء", difficulty = "HARD", isSelected = true),
+                    SubjectPrefEntity(name = "الكيمياء", difficulty = "MEDIUM", isSelected = true),
+                    SubjectPrefEntity(name = "اللغة العربية", difficulty = "MEDIUM", isSelected = true),
+                    SubjectPrefEntity(name = "اللغة الإنجليزية", difficulty = "EASY", isSelected = true)
                 )
             )
         }

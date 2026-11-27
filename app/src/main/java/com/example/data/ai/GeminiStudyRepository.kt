@@ -1,212 +1,188 @@
 package com.example.data.ai
 
 import android.graphics.Bitmap
+import android.util.Base64
 import android.util.Log
+import com.example.BuildConfig
 import com.example.data.local.BusySlotEntity
 import com.example.data.local.ScheduleSessionEntity
 import com.example.data.local.SubjectPrefEntity
 import com.example.i18n.AppLanguage
-import com.google.firebase.Firebase
-import com.google.firebase.ai.ai
-import com.google.firebase.ai.type.Schema
-import com.google.firebase.ai.type.content
-import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 private const val TAG = "GeminiStudyRepository"
-private const val MODEL_ID = "gemini-3.8-flash"
+private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+private val MODELS_FALLBACK = listOf("gemini-2.5-flash", "gemini-2.5-flash-lite")
 
 class GeminiStudyRepository {
 
-    private val streamingTeacherModel by lazy {
-        Firebase.ai.generativeModel(modelName = MODEL_ID)
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(25, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(65, TimeUnit.SECONDS)
+            .build()
     }
 
-    private val lessonModel by lazy {
-        val schema = Schema.obj(
-            properties = mapOf(
-                "title" to Schema.string(description = "Concise descriptive title of the lesson"),
-                "simplifiedExplanation" to Schema.string(
-                    description = "Clear, warm, encouraging explanation in the style of a brilliant teacher using analogies and structured bullet points"
-                ),
-                "outsideConnections" to Schema.string(
-                    description = "Real-world examples and cross-topic connections outside the lesson textbook"
-                ),
-                "importantQuestionsRadar" to Schema.string(
-                    description = "High-probability exam questions, common traps, and key focus alerts"
-                ),
-                "mustMemorize" to Schema.string(
-                    description = "Exact definitions, formulas, dates, rules, or terms that MUST be memorized verbatim, cleanly separated from conceptual explanation"
+    private fun requireApiKey(): String {
+        val key = BuildConfig.GEMINI_API_KEY.trim()
+        if (key.isEmpty() || key == "MY_GEMINI_API_KEY") {
+            throw IllegalStateException("Gemini API key is not configured in BuildConfig.")
+        }
+        return key
+    }
+
+    private fun prepareBitmapBase64(bitmap: Bitmap): String {
+        val maxSide = 1280
+        val width = bitmap.width
+        val height = bitmap.height
+        val scaled = if (width > maxSide || height > maxSide) {
+            val scale = min(maxSide.toFloat() / width, maxSide.toFloat() / height)
+            val newW = (width * scale).roundToInt().coerceAtLeast(1)
+            val newH = (height * scale).roundToInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+        } else {
+            bitmap
+        }
+
+        val stream = ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.JPEG, 85, stream)
+        if (scaled !== bitmap) {
+            scaled.recycle()
+        }
+        return Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+    }
+
+    private fun buildRequestJson(
+        prompt: String,
+        bitmap: Bitmap? = null,
+        responseSchema: JSONObject? = null
+    ): JSONObject {
+        val parts = JSONArray()
+        if (bitmap != null) {
+            val b64 = prepareBitmapBase64(bitmap)
+            parts.put(
+                JSONObject().put(
+                    "inline_data",
+                    JSONObject()
+                        .put("mime_type", "image/jpeg")
+                        .put("data", b64)
                 )
             )
+        }
+        parts.put(JSONObject().put("text", prompt))
+
+        val body = JSONObject().put(
+            "contents",
+            JSONArray().put(JSONObject().put("parts", parts))
         )
-        Firebase.ai.generativeModel(
-            modelName = MODEL_ID,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = schema
-            }
-        )
+
+        if (responseSchema != null) {
+            body.put(
+                "generationConfig",
+                JSONObject()
+                    .put("responseMimeType", "application/json")
+                    .put("responseSchema", responseSchema)
+            )
+        }
+        return body
     }
 
-    private val evaluationModel by lazy {
-        val schema = Schema.obj(
-            properties = mapOf(
-                "scoreOutOf10" to Schema.integer(description = "Score from 1 to 10"),
-                "praise" to Schema.string(description = "Warm encouraging praise of what the student understood well"),
-                "corrections" to Schema.string(description = "Gentle, clear correction of missing or inaccurate points"),
-                "closingQuestion" to Schema.string(description = "Encouraging closing question asking if they want more practice or are all good")
-            )
-        )
-        Firebase.ai.generativeModel(
-            modelName = MODEL_ID,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = schema
-            }
-        )
-    }
+    private suspend fun callGenerateContent(
+        prompt: String,
+        bitmap: Bitmap? = null,
+        responseSchema: JSONObject? = null,
+        onRetrying: (() -> Unit)? = null
+    ): String {
+        val apiKey = requireApiKey()
+        val payload = buildRequestJson(prompt, bitmap, responseSchema).toString()
+        val mediaType = "application/json; charset=utf-8".toMediaType()
 
-    private val examModel by lazy {
-        val questionSchema = Schema.obj(
-            properties = mapOf(
-                "type" to Schema.enumeration(
-                    values = listOf("MCQ", "TRUE_FALSE", "SHORT_ESSAY"),
-                    description = "Question format"
-                ),
-                "questionText" to Schema.string(description = "The question prompt strictly grounded in the provided content"),
-                "options" to Schema.array(
-                    items = Schema.string(),
-                    description = "4 answer choices for MCQ, 2 choices for TRUE_FALSE, or empty list for SHORT_ESSAY"
-                ),
-                "correctAnswer" to Schema.string(description = "Exact correct option text or concise model answer"),
-                "explanation" to Schema.string(description = "Brief encouraging teacher explanation referencing the uploaded content")
-            )
+        var lastError: Exception? = null
+        val attempts = listOf(
+            MODELS_FALLBACK[0] to 1000L,
+            MODELS_FALLBACK[0] to 2200L,
+            MODELS_FALLBACK[1] to 0L
         )
-        val schema = Schema.obj(
-            properties = mapOf(
-                "questions" to Schema.array(items = questionSchema)
-            )
-        )
-        Firebase.ai.generativeModel(
-            modelName = MODEL_ID,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = schema
-            }
-        )
-    }
 
-    private val gradingModel by lazy {
-        val itemSchema = Schema.obj(
-            properties = mapOf(
-                "index" to Schema.integer(description = "0-based question index"),
-                "isCorrect" to Schema.boolean(description = "Whether the student answer is fully or mostly correct"),
-                "earnedRatio" to Schema.double(description = "Score ratio from 0.0 to 1.0"),
-                "feedback" to Schema.string(description = "Warm, constructive teacher feedback explaining why")
-            )
-        )
-        val schema = Schema.obj(
-            properties = mapOf(
-                "overallTeacherNote" to Schema.string(description = "Encouraging overall summary from the smart teacher"),
-                "items" to Schema.array(items = itemSchema)
-            )
-        )
-        Firebase.ai.generativeModel(
-            modelName = MODEL_ID,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = schema
-            }
-        )
-    }
-
-    private val flashcardModel by lazy {
-        val cardSchema = Schema.obj(
-            properties = mapOf(
-                "front" to Schema.string(description = "Short front question or key term"),
-                "back" to Schema.string(description = "Clear concise answer or definition")
-            )
-        )
-        val schema = Schema.obj(
-            properties = mapOf(
-                "cards" to Schema.array(items = cardSchema)
-            )
-        )
-        Firebase.ai.generativeModel(
-            modelName = MODEL_ID,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = schema
-            }
-        )
-    }
-
-    private val scheduleAdviceModel by lazy {
-        val subjectBlockSchema = Schema.obj(
-            properties = mapOf(
-                "subjectName" to Schema.string(),
-                "focusTip" to Schema.string(description = "Calm 1-line study focus tip for this subject")
-            )
-        )
-        val schema = Schema.obj(
-            properties = mapOf(
-                "orderedTips" to Schema.array(items = subjectBlockSchema)
-            )
-        )
-        Firebase.ai.generativeModel(
-            modelName = MODEL_ID,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = schema
-            }
-        )
-    }
-
-    private suspend fun <T> executeWithSmartRetry(
-        maxAttempts: Int = 3,
-        onRetrying: (() -> Unit)? = null,
-        block: suspend () -> T
-    ): T {
-        var lastException: Exception? = null
-        for (attempt in 1..maxAttempts) {
+        for ((idx, pair) in attempts.withIndex()) {
+            val (modelId, backoffMs) = pair
             try {
                 return withTimeout(60_000L) {
-                    block()
+                    withContext(Dispatchers.IO) {
+                        val request = Request.Builder()
+                            .url("$BASE_URL/$modelId:generateContent")
+                            .addHeader("x-goog-api-key", apiKey)
+                            .addHeader("Content-Type", "application/json")
+                            .post(payload.toRequestBody(mediaType))
+                            .build()
+
+                        client.newCall(request).execute().use { response ->
+                            val rawBody = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                val errMsg = extractApiError(rawBody, response.code)
+                                throw IOException("HTTP ${response.code}: $errMsg")
+                            }
+                            extractCandidateText(rawBody)
+                                ?: throw IOException("Empty response from Gemini.")
+                        }
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                lastException = e
-                Log.w(TAG, "AI call attempt $attempt failed: ${e.message}", e)
-                if (attempt < maxAttempts) {
+                lastError = e
+                Log.w(TAG, "Direct Gemini call attempt ${idx + 1} ($modelId) failed: ${e.message}")
+                if (idx < attempts.lastIndex) {
                     onRetrying?.invoke()
-                    val backoffMs = attempt * 1300L
-                    delay(backoffMs)
+                    if (backoffMs > 0L) delay(backoffMs)
                 }
             }
         }
-        throw lastException ?: IllegalStateException("AI request failed after retries.")
+        throw lastError ?: IllegalStateException("AI request failed after retries.")
     }
 
-    private fun prepareBitmap(bitmap: Bitmap): Bitmap {
-        val maxSide = 1280
-        val width = bitmap.width
-        val height = bitmap.height
-        if (width <= maxSide && height <= maxSide) return bitmap
-        val scale = min(maxSide.toFloat() / width, maxSide.toFloat() / height)
-        val newW = (width * scale).roundToInt().coerceAtLeast(1)
-        val newH = (height * scale).roundToInt().coerceAtLeast(1)
-        return Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+    private fun extractApiError(rawBody: String, code: Int): String {
+        return try {
+            val obj = JSONObject(rawBody)
+            obj.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+                ?: "Request failed ($code)"
+        } catch (_: Exception) {
+            "Request failed ($code)"
+        }
+    }
+
+    private fun extractCandidateText(rawBody: String): String? {
+        val root = JSONObject(rawBody)
+        val candidates = root.optJSONArray("candidates") ?: return null
+        if (candidates.length() == 0) return null
+        val content = candidates.getJSONObject(0).optJSONObject("content") ?: return null
+        val parts = content.optJSONArray("parts") ?: return null
+        val sb = StringBuilder()
+        for (i in 0 until parts.length()) {
+            val t = parts.getJSONObject(i).optString("text")
+            if (t.isNotEmpty()) sb.append(t)
+        }
+        return sb.toString().takeIf { it.isNotBlank() }
     }
 
     private fun languageInstruction(lang: AppLanguage): String = when (lang) {
@@ -251,18 +227,29 @@ class GeminiStudyRepository {
             }
         }
 
-        val scaledBitmap = bitmap?.let { prepareBitmap(it) }
-
-        val response = executeWithSmartRetry(onRetrying = onRetrying) {
-            lessonModel.generateContent(
-                content {
-                    if (scaledBitmap != null) image(scaledBitmap)
-                    text(prompt)
-                }
+        val schema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject()
+                    .put("title", JSONObject().put("type", "STRING"))
+                    .put("simplifiedExplanation", JSONObject().put("type", "STRING"))
+                    .put("outsideConnections", JSONObject().put("type", "STRING"))
+                    .put("importantQuestionsRadar", JSONObject().put("type", "STRING"))
+                    .put("mustMemorize", JSONObject().put("type", "STRING"))
             )
-        }
+            .put(
+                "required",
+                JSONArray(listOf("title", "simplifiedExplanation", "outsideConnections", "importantQuestionsRadar", "mustMemorize"))
+            )
 
-        val raw = response.text ?: throw IllegalStateException("Empty response from AI tutor.")
+        val raw = callGenerateContent(
+            prompt = prompt,
+            bitmap = bitmap,
+            responseSchema = schema,
+            onRetrying = onRetrying
+        )
+
         val json = JSONObject(raw)
         return LessonBreakdown(
             title = json.optString("title").ifBlank { if (lang == AppLanguage.AR) "شرح الدرس" else "Lesson Breakdown" },
@@ -278,6 +265,7 @@ class GeminiStudyRepository {
         studentQuestion: String,
         lang: AppLanguage
     ): Flow<String> = flow {
+        val apiKey = requireApiKey()
         val prompt = buildString {
             appendLine(languageInstruction(lang))
             appendLine("The student is studying this lesson and didn't understand a specific point. Clarify it warmly like a patient, brilliant teacher with a fresh analogy or concrete example.")
@@ -285,31 +273,54 @@ class GeminiStudyRepository {
             appendLine("\nStudent's Question:\n$studentQuestion")
         }
 
+        val payload = buildRequestJson(prompt).toString()
+        val mediaType = "application/json; charset=utf-8".toMediaType()
         val accumulated = StringBuilder()
-        var attempt = 0
-        val maxAttempts = 2
-        while (true) {
-            attempt++
+
+        var streamed = false
+        for (modelId in MODELS_FALLBACK) {
             try {
-                withTimeout(60_000L) {
-                    streamingTeacherModel.generateContentStream(prompt).collect { chunk ->
-                        val part = chunk.text.orEmpty()
-                        if (part.isNotEmpty()) {
-                            accumulated.append(part)
-                            emit(accumulated.toString())
+                val request = Request.Builder()
+                    .url("$BASE_URL/$modelId:streamGenerateContent?alt=sse")
+                    .addHeader("x-goog-api-key", apiKey)
+                    .addHeader("Content-Type", "application/json")
+                    .post(payload.toRequestBody(mediaType))
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        val errBody = response.body?.string().orEmpty()
+                        throw IOException("HTTP ${response.code}: ${extractApiError(errBody, response.code)}")
+                    }
+                    val source = response.body?.source() ?: throw IOException("Empty stream body")
+                    while (!source.exhausted()) {
+                        val line = source.readUtf8Line() ?: break
+                        if (line.startsWith("data:")) {
+                            val dataStr = line.removePrefix("data:").trim()
+                            if (dataStr.isNotEmpty() && dataStr != "[DONE]") {
+                                val chunkText = extractCandidateText(dataStr)
+                                if (!chunkText.isNullOrEmpty()) {
+                                    accumulated.append(chunkText)
+                                    emit(accumulated.toString())
+                                    streamed = true
+                                }
+                            }
                         }
                     }
                 }
-                break
+                if (streamed) return@flow
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (attempt >= maxAttempts) throw e
+                Log.w(TAG, "Stream attempt ($modelId) failed: ${e.message}")
                 accumulated.clear()
-                delay(1200L)
             }
         }
-    }
+
+        // Unary fallback if SSE failed
+        val full = callGenerateContent(prompt = prompt)
+        emit(full)
+    }.flowOn(Dispatchers.IO)
 
     suspend fun evaluateStudentExplanation(
         lessonContext: String,
@@ -331,10 +342,19 @@ class GeminiStudyRepository {
             appendLine("\nStudent's Own Explanation:\n$studentExplanation")
         }
 
-        val response = executeWithSmartRetry(onRetrying = onRetrying) {
-            evaluationModel.generateContent(prompt)
-        }
-        val raw = response.text ?: throw IllegalStateException("Empty evaluation response.")
+        val schema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject()
+                    .put("scoreOutOf10", JSONObject().put("type", "INTEGER"))
+                    .put("praise", JSONObject().put("type", "STRING"))
+                    .put("corrections", JSONObject().put("type", "STRING"))
+                    .put("closingQuestion", JSONObject().put("type", "STRING"))
+            )
+            .put("required", JSONArray(listOf("scoreOutOf10", "praise", "corrections", "closingQuestion")))
+
+        val raw = callGenerateContent(prompt = prompt, responseSchema = schema, onRetrying = onRetrying)
         val json = JSONObject(raw)
         return StudentEvaluation(
             scoreOutOf10 = json.optInt("scoreOutOf10", 8).coerceIn(1, 10),
@@ -400,18 +420,49 @@ class GeminiStudyRepository {
             }
         }
 
-        val scaledBitmap = bitmap?.let { prepareBitmap(it) }
-
-        val response = executeWithSmartRetry(onRetrying = onRetrying) {
-            examModel.generateContent(
-                content {
-                    if (scaledBitmap != null) image(scaledBitmap)
-                    text(prompt)
-                }
+        val questionItemSchema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject()
+                    .put(
+                        "type",
+                        JSONObject()
+                            .put("type", "STRING")
+                            .put("enum", JSONArray(listOf("MCQ", "TRUE_FALSE", "SHORT_ESSAY")))
+                    )
+                    .put("questionText", JSONObject().put("type", "STRING"))
+                    .put(
+                        "options",
+                        JSONObject()
+                            .put("type", "ARRAY")
+                            .put("items", JSONObject().put("type", "STRING"))
+                    )
+                    .put("correctAnswer", JSONObject().put("type", "STRING"))
+                    .put("explanation", JSONObject().put("type", "STRING"))
             )
-        }
+            .put("required", JSONArray(listOf("type", "questionText", "options", "correctAnswer", "explanation")))
 
-        val raw = response.text ?: throw IllegalStateException("Empty exam response.")
+        val schema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject().put(
+                    "questions",
+                    JSONObject()
+                        .put("type", "ARRAY")
+                        .put("items", questionItemSchema)
+                )
+            )
+            .put("required", JSONArray(listOf("questions")))
+
+        val raw = callGenerateContent(
+            prompt = prompt,
+            bitmap = bitmap,
+            responseSchema = schema,
+            onRetrying = onRetrying
+        )
+
         val root = JSONObject(raw)
         val arr = root.optJSONArray("questions") ?: JSONArray()
         val questions = mutableListOf<ExamQuestion>()
@@ -459,16 +510,38 @@ class GeminiStudyRepository {
         val prompt = buildString {
             appendLine(languageInstruction(lang))
             appendLine("Grade each student answer fairly against the modelAnswer. For MCQ/TRUE_FALSE, exact/semantic match gets earnedRatio = 1.0, wrong gets 0.0. For SHORT_ESSAY, award partial credit (0.0 to 1.0) accurately and give encouraging teacher feedback.")
-            appendLine("\nQuestions and Answers:\n${payload.toString()}")
+            appendLine("\nQuestions and Answers:\n$payload")
         }
 
-        val response = executeWithSmartRetry(onRetrying = onRetrying) {
-            gradingModel.generateContent(prompt)
-        }
-        val raw = response.text ?: throw IllegalStateException("Empty grading response.")
+        val itemSchema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject()
+                    .put("index", JSONObject().put("type", "INTEGER"))
+                    .put("isCorrect", JSONObject().put("type", "BOOLEAN"))
+                    .put("earnedRatio", JSONObject().put("type", "NUMBER"))
+                    .put("feedback", JSONObject().put("type", "STRING"))
+            )
+            .put("required", JSONArray(listOf("index", "isCorrect", "earnedRatio", "feedback")))
+
+        val schema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject()
+                    .put("overallTeacherNote", JSONObject().put("type", "STRING"))
+                    .put(
+                        "items",
+                        JSONObject().put("type", "ARRAY").put("items", itemSchema)
+                    )
+            )
+            .put("required", JSONArray(listOf("overallTeacherNote", "items")))
+
+        val raw = callGenerateContent(prompt = prompt, responseSchema = schema, onRetrying = onRetrying)
         val root = JSONObject(raw)
         val itemsArr = root.optJSONArray("items") ?: JSONArray()
-        val resultMap = mutableMapOf<Int, Pair<Boolean, Pair<Double, String>>>()
+        val resultMap = mutableMapOf<Int, Triple<Boolean, Double, String>>()
         for (i in 0 until itemsArr.length()) {
             val obj = itemsArr.getJSONObject(i)
             val idx = obj.optInt("index", i)
@@ -476,7 +549,7 @@ class GeminiStudyRepository {
                 .coerceIn(0.0, 1.0)
             val isCorrect = obj.optBoolean("isCorrect", ratio >= 0.7)
             val fb = obj.optString("feedback")
-            resultMap[idx] = isCorrect to (ratio to fb)
+            resultMap[idx] = Triple(isCorrect, ratio, fb)
         }
 
         val gradedList = questions.map { q ->
@@ -487,8 +560,8 @@ class GeminiStudyRepository {
             val fb: String
             if (entry != null) {
                 isCorrect = entry.first
-                ratio = entry.second.first
-                fb = entry.second.second.ifBlank { q.explanation }
+                ratio = entry.second
+                fb = entry.third.ifBlank { q.explanation }
             } else {
                 val match = studentAns.trim().equals(q.correctAnswer.trim(), ignoreCase = true)
                 isCorrect = match
@@ -545,16 +618,32 @@ class GeminiStudyRepository {
                 appendLine("\nContent:\n$sourceText")
             }
         }
-        val scaledBitmap = bitmap?.let { prepareBitmap(it) }
-        val response = executeWithSmartRetry(onRetrying = onRetrying) {
-            flashcardModel.generateContent(
-                content {
-                    if (scaledBitmap != null) image(scaledBitmap)
-                    text(prompt)
-                }
+
+        val cardSchema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject()
+                    .put("front", JSONObject().put("type", "STRING"))
+                    .put("back", JSONObject().put("type", "STRING"))
             )
-        }
-        val raw = response.text ?: throw IllegalStateException("Empty flashcards response.")
+            .put("required", JSONArray(listOf("front", "back")))
+
+        val schema = JSONObject()
+            .put("type", "OBJECT")
+            .put(
+                "properties",
+                JSONObject().put("cards", JSONObject().put("type", "ARRAY").put("items", cardSchema))
+            )
+            .put("required", JSONArray(listOf("cards")))
+
+        val raw = callGenerateContent(
+            prompt = prompt,
+            bitmap = bitmap,
+            responseSchema = schema,
+            onRetrying = onRetrying
+        )
+
         val arr = JSONObject(raw).optJSONArray("cards") ?: JSONArray()
         return (0 until arr.length()).map { i ->
             val obj = arr.getJSONObject(i)
@@ -565,13 +654,6 @@ class GeminiStudyRepository {
         }.filter { it.front.isNotBlank() && it.back.isNotBlank() }
     }
 
-    /**
-     * Generates a calm, optimal study schedule that:
-     * 1) Mathematically excludes 100% of busy slots (never overlaps any blocked window)
-     * 2) Allocates longer deep blocks (75m) for HARD, medium (45m) for MEDIUM, shorter (30m) for EASY
-     * 3) Inserts explicit 15-min rest breaks between sessions
-     * 4) Enhances each session with Gemini's smart teacher strategy & ordering
-     */
     suspend fun generateSmartSchedule(
         busySlots: List<BusySlotEntity>,
         subjects: List<SubjectPrefEntity>,
@@ -580,7 +662,6 @@ class GeminiStudyRepository {
         lang: AppLanguage,
         onRetrying: () -> Unit = {}
     ): List<ScheduleSessionEntity> {
-        // 1. Ask Gemini for smart ordering (e.g., hard subjects in calm peak times) + focus tip
         val subjectListDesc = subjects.joinToString("\n") { "- ${it.name} (${it.difficulty})" }
         val tipMap = mutableMapOf<String, String>()
         val orderedSubjects = mutableListOf<SubjectPrefEntity>()
@@ -591,10 +672,25 @@ class GeminiStudyRepository {
                 appendLine("Order these study subjects from best calm deep-focus priority to lightest review, and provide a short 1-sentence encouraging focus tip for each:")
                 appendLine(subjectListDesc)
             }
-            val resp = executeWithSmartRetry(maxAttempts = 2, onRetrying = onRetrying) {
-                scheduleAdviceModel.generateContent(prompt)
-            }
-            val arr = JSONObject(resp.text.orEmpty()).optJSONArray("orderedTips") ?: JSONArray()
+            val tipSchema = JSONObject()
+                .put("type", "OBJECT")
+                .put(
+                    "properties",
+                    JSONObject()
+                        .put("subjectName", JSONObject().put("type", "STRING"))
+                        .put("focusTip", JSONObject().put("type", "STRING"))
+                )
+                .put("required", JSONArray(listOf("subjectName", "focusTip")))
+            val schema = JSONObject()
+                .put("type", "OBJECT")
+                .put(
+                    "properties",
+                    JSONObject().put("orderedTips", JSONObject().put("type", "ARRAY").put("items", tipSchema))
+                )
+                .put("required", JSONArray(listOf("orderedTips")))
+
+            val raw = callGenerateContent(prompt = prompt, responseSchema = schema, onRetrying = onRetrying)
+            val arr = JSONObject(raw).optJSONArray("orderedTips") ?: JSONArray()
             val byName = subjects.associateBy { it.name.trim().lowercase() }
             for (i in 0 until arr.length()) {
                 val item = arr.getJSONObject(i)
@@ -611,7 +707,6 @@ class GeminiStudyRepository {
             Log.w(TAG, "Schedule AI ordering fallback used", e)
         }
 
-        // Ensure every selected subject is included, prioritizing HARD -> MEDIUM -> EASY if not ordered
         subjects.sortedByDescending {
             when (it.difficulty) {
                 "HARD" -> 3
@@ -624,7 +719,6 @@ class GeminiStudyRepository {
             }
         }
 
-        // 2. Compute exact free intervals inside [windowStartMinutes, windowEndMinutes] excluding ALL busySlots
         val freeIntervals = computeFreeIntervals(windowStartMinutes, windowEndMinutes, busySlots)
         if (freeIntervals.isEmpty()) return emptyList()
 
@@ -644,7 +738,6 @@ class GeminiStudyRepository {
             }
             val breakMins = if (subj.difficulty == "HARD") 15 else 10
 
-            // Find an interval that can accommodate at least 20 mins
             while (intervalIdx < freeIntervals.size) {
                 val intervalEnd = freeIntervals[intervalIdx].second
                 val remaining = intervalEnd - cursor
@@ -690,7 +783,6 @@ class GeminiStudyRepository {
             )
             cursor = studyEnd
 
-            // Add explicit rest break between sessions if there is room before next interval or after
             val isLastSubject = idx == orderedSubjects.lastIndex
             if (!isLastSubject && intervalEnd - cursor >= breakMins + 15) {
                 val breakStart = cursor
@@ -719,7 +811,6 @@ class GeminiStudyRepository {
         busySlots: List<BusySlotEntity>
     ): List<Pair<Int, Int>> {
         if (windowEnd <= windowStart) return emptyList()
-        // Expand overnight busy slots (e.g., 23:00 to 07:00) into clipped intervals inside [0, 1440]
         val blocked = mutableListOf<Pair<Int, Int>>()
         for (slot in busySlots) {
             if (slot.endMinutes > slot.startMinutes) {

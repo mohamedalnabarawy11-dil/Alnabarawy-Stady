@@ -526,7 +526,7 @@ private fun ScheduleSessionCard(
                             color = palette.gold.copy(alpha = 0.18f)
                         ) {
                             Text(
-                                text = "$diffBadge • ${session.durationMinutes}m",
+                                text = "$diffBadge • ${session.durationMinutes} ${strings.minutesUnit}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = palette.gold,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)

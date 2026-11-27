@@ -3,7 +3,6 @@ package com.example.ui.components
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -11,7 +10,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -57,11 +55,13 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.audio.SoundEngine
+import com.example.core.ImageUtils
 import com.example.i18n.AppStrings
 import com.example.ui.theme.ChampagneGold
 import com.example.ui.theme.IvoryWhite
 import com.example.ui.theme.LocalNabraawyColors
 import com.example.ui.theme.ObsidianPure
+import java.io.File
 
 private const val TAG = "CameraCaptureModal"
 
@@ -156,7 +156,11 @@ fun CameraCaptureModal(
                         .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                         .build()
                 }
-                val previewView = remember { PreviewView(context) }
+                val previewView = remember {
+                    PreviewView(context).apply {
+                        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                    }
+                }
 
                 DisposableEffect(lifecycleOwner) {
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -258,42 +262,35 @@ fun CameraCaptureModal(
                         testTagName = "camera_capture_button",
                         onClick = {
                             isCapturing = true
+                            cameraError = null
+                            val tempFile = File(context.cacheDir, "nabraawy_cam_${System.currentTimeMillis()}.jpg")
+                            val outputOptions = ImageCapture.OutputFileOptions.Builder(tempFile).build()
                             val executor = ContextCompat.getMainExecutor(context)
                             imageCapture.takePicture(
+                                outputOptions,
                                 executor,
-                                object : ImageCapture.OnImageCapturedCallback() {
-                                    override fun onCaptureSuccess(image: ImageProxy) {
+                                object : ImageCapture.OnImageSavedCallback {
+                                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                                         try {
-                                            val rawBmp = image.toBitmap()
-                                            val rotation = image.imageInfo.rotationDegrees
-                                            val rotated = if (rotation != 0) {
-                                                val matrix = Matrix().apply {
-                                                    postRotate(rotation.toFloat())
-                                                }
-                                                Bitmap.createBitmap(
-                                                    rawBmp,
-                                                    0,
-                                                    0,
-                                                    rawBmp.width,
-                                                    rawBmp.height,
-                                                    matrix,
-                                                    true
-                                                )
+                                            val bmp = ImageUtils.decodeFileToSafeBitmap(tempFile)
+                                            if (bmp != null) {
+                                                onCaptured(bmp)
                                             } else {
-                                                rawBmp
+                                                cameraError = "Could not process captured photo."
+                                                isCapturing = false
                                             }
-                                            onCaptured(rotated)
                                         } catch (e: Exception) {
-                                            Log.e(TAG, "Bitmap conversion failed", e)
+                                            Log.e(TAG, "Captured file decode failed", e)
                                             cameraError = e.localizedMessage
                                             isCapturing = false
                                         } finally {
-                                            image.close()
+                                            tempFile.delete()
                                         }
                                     }
 
                                     override fun onError(exception: ImageCaptureException) {
                                         Log.e(TAG, "Capture error", exception)
+                                        tempFile.delete()
                                         cameraError = exception.localizedMessage
                                         isCapturing = false
                                     }
