@@ -28,9 +28,13 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
+          rm -f app/src/main/java/com/example/core/AppCheckInit.kt
+          rm -f app/google-services.json
+          rm -f app/src/main/res/values/firebase_applet_config.xml
           sed -i '/foojay-resolver-convention/d' settings.gradle.kts
-          if [ -n "$GEMINI_API_KEY" ]; then
-            echo "GEMINI_API_KEY=$GEMINI_API_KEY" > .env
+          CLEAN_KEY=$(printf '%s' "$GEMINI_API_KEY" | tr -d '[:space:]')
+          if [ -n "$CLEAN_KEY" ]; then
+            printf 'GEMINI_API_KEY=%s\n' "$CLEAN_KEY" > .env
           fi
           if [ -f debug.keystore.base64 ]; then
             base64 -d debug.keystore.base64 > debug.keystore
@@ -45,7 +49,7 @@ jobs:
           fi
 
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon
+        run: gradle :app:assembleDebug --no-daemon --no-build-cache
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
