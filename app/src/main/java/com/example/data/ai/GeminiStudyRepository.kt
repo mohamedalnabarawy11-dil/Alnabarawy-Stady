@@ -30,7 +30,11 @@ import kotlin.math.roundToInt
 
 private const val TAG = "GeminiStudyRepository"
 private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-private val MODELS_FALLBACK = listOf("gemini-2.5-flash", "gemini-2.5-flash-lite")
+private val MODELS_FALLBACK = listOf(
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite"
+)
 
 class GeminiStudyRepository {
 
@@ -107,6 +111,20 @@ class GeminiStudyRepository {
         return body
     }
 
+    private class HttpStatusException(val statusCode: Int, message: String) : IOException(message)
+
+    private fun cleanJsonIfNeeded(text: String, expectJson: Boolean): String {
+        if (!expectJson) return text
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("```")) return trimmed
+        return trimmed
+            .removePrefix("```json")
+            .removePrefix("```JSON")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+    }
+
     private suspend fun callGenerateContent(
         prompt: String,
         bitmap: Bitmap? = null,
@@ -118,43 +136,47 @@ class GeminiStudyRepository {
         val mediaType = "application/json; charset=utf-8".toMediaType()
 
         var lastError: Exception? = null
-        val attempts = listOf(
-            MODELS_FALLBACK[0] to 1000L,
-            MODELS_FALLBACK[0] to 2200L,
-            MODELS_FALLBACK[1] to 0L
-        )
 
-        for ((idx, pair) in attempts.withIndex()) {
-            val (modelId, backoffMs) = pair
-            try {
-                return withTimeout(60_000L) {
-                    withContext(Dispatchers.IO) {
-                        val request = Request.Builder()
-                            .url("$BASE_URL/$modelId:generateContent")
-                            .addHeader("x-goog-api-key", apiKey)
-                            .addHeader("Content-Type", "application/json")
-                            .post(payload.toRequestBody(mediaType))
-                            .build()
+        for ((modelIdx, modelId) in MODELS_FALLBACK.withIndex()) {
+            val maxModelAttempts = 2
+            for (attempt in 0 until maxModelAttempts) {
+                try {
+                    return withTimeout(60_000L) {
+                        withContext(Dispatchers.IO) {
+                            val request = Request.Builder()
+                                .url("$BASE_URL/$modelId:generateContent")
+                                .addHeader("x-goog-api-key", apiKey)
+                                .addHeader("Content-Type", "application/json")
+                                .post(payload.toRequestBody(mediaType))
+                                .build()
 
-                        client.newCall(request).execute().use { response ->
-                            val rawBody = response.body?.string().orEmpty()
-                            if (!response.isSuccessful) {
-                                val errMsg = extractApiError(rawBody, response.code)
-                                throw IOException("HTTP ${response.code}: $errMsg")
+                            client.newCall(request).execute().use { response ->
+                                val rawBody = response.body?.string().orEmpty()
+                                if (!response.isSuccessful) {
+                                    val errMsg = extractApiError(rawBody, response.code)
+                                    throw HttpStatusException(response.code, "HTTP ${response.code}: $errMsg")
+                                }
+                                val text = extractCandidateText(rawBody)
+                                    ?: throw IOException("Empty response from Gemini.")
+                                cleanJsonIfNeeded(text, responseSchema != null)
                             }
-                            extractCandidateText(rawBody)
-                                ?: throw IOException("Empty response from Gemini.")
                         }
                     }
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                lastError = e
-                Log.w(TAG, "Direct Gemini call attempt ${idx + 1} ($modelId) failed: ${e.message}")
-                if (idx < attempts.lastIndex) {
-                    onRetrying?.invoke()
-                    if (backoffMs > 0L) delay(backoffMs)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastError = e
+                    Log.w(TAG, "Direct Gemini call ($modelId, attempt ${attempt + 1}) failed: ${e.message}")
+                    val nonRetryableForModel = e is HttpStatusException && e.statusCode in listOf(400, 401, 403, 404)
+                    val hasMoreAttempts = attempt < maxModelAttempts - 1 && !nonRetryableForModel
+                    val hasMoreModels = modelIdx < MODELS_FALLBACK.lastIndex
+                    if (hasMoreAttempts) {
+                        onRetrying?.invoke()
+                        delay(1200L)
+                    } else if (hasMoreModels) {
+                        onRetrying?.invoke()
+                        break
+                    }
                 }
             }
         }
@@ -179,7 +201,9 @@ class GeminiStudyRepository {
         val parts = content.optJSONArray("parts") ?: return null
         val sb = StringBuilder()
         for (i in 0 until parts.length()) {
-            val t = parts.getJSONObject(i).optString("text")
+            val part = parts.getJSONObject(i)
+            if (part.optBoolean("thought", false)) continue
+            val t = part.optString("text")
             if (t.isNotEmpty()) sb.append(t)
         }
         return sb.toString().takeIf { it.isNotBlank() }
