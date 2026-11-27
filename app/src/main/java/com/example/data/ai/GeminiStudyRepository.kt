@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -24,6 +25,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -31,19 +34,29 @@ import kotlin.math.roundToInt
 private const val TAG = "GeminiStudyRepository"
 private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 private val MODELS_FALLBACK = listOf(
-    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
-    "gemini-3.5-flash-lite"
+    "gemini-3.8-flash"
 )
 
 class GeminiStudyRepository {
 
+    private val ipv4FirstDns = object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            val all = Dns.SYSTEM.lookup(hostname)
+            val ipv4 = all.filter { it is Inet4Address }
+            val other = all.filter { it !is Inet4Address }
+            return if (ipv4.isNotEmpty()) ipv4 + other else all
+        }
+    }
+
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(25, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
-            .callTimeout(65, TimeUnit.SECONDS)
+            .dns(ipv4FirstDns)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(25, TimeUnit.SECONDS)
             .build()
     }
 
@@ -56,7 +69,7 @@ class GeminiStudyRepository {
     }
 
     private fun prepareBitmapBase64(bitmap: Bitmap): String {
-        val maxSide = 1280
+        val maxSide = 960
         val width = bitmap.width
         val height = bitmap.height
         val scaled = if (width > maxSide || height > maxSide) {
@@ -69,7 +82,7 @@ class GeminiStudyRepository {
         }
 
         val stream = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 85, stream)
+        scaled.compress(Bitmap.CompressFormat.JPEG, 75, stream)
         if (scaled !== bitmap) {
             scaled.recycle()
         }
@@ -78,18 +91,19 @@ class GeminiStudyRepository {
 
     private fun buildRequestJson(
         prompt: String,
-        bitmap: Bitmap? = null,
-        responseSchema: JSONObject? = null
+        precomputedBase64: String? = null,
+        responseSchema: JSONObject? = null,
+        thinkingLevel: String? = null,
+        maxOutputTokens: Int = 1800
     ): JSONObject {
         val parts = JSONArray()
-        if (bitmap != null) {
-            val b64 = prepareBitmapBase64(bitmap)
+        if (precomputedBase64 != null) {
             parts.put(
                 JSONObject().put(
                     "inline_data",
                     JSONObject()
                         .put("mime_type", "image/jpeg")
-                        .put("data", b64)
+                        .put("data", precomputedBase64)
                 )
             )
         }
@@ -100,14 +114,20 @@ class GeminiStudyRepository {
             JSONArray().put(JSONObject().put("parts", parts))
         )
 
+        val genConfig = JSONObject()
+            .put("maxOutputTokens", maxOutputTokens)
         if (responseSchema != null) {
-            body.put(
-                "generationConfig",
-                JSONObject()
-                    .put("responseMimeType", "application/json")
-                    .put("responseSchema", responseSchema)
+            genConfig
+                .put("responseMimeType", "application/json")
+                .put("responseSchema", responseSchema)
+        }
+        if (thinkingLevel != null) {
+            genConfig.put(
+                "thinkingConfig",
+                JSONObject().put("thinkingLevel", thinkingLevel)
             )
         }
+        body.put("generationConfig", genConfig)
         return body
     }
 
@@ -129,20 +149,35 @@ class GeminiStudyRepository {
         prompt: String,
         bitmap: Bitmap? = null,
         responseSchema: JSONObject? = null,
+        thinkingLevel: String? = "minimal",
+        timeoutMs: Long = 22_000L,
         onRetrying: (() -> Unit)? = null
     ): String {
         val apiKey = requireApiKey()
-        val payload = buildRequestJson(prompt, bitmap, responseSchema).toString()
         val mediaType = "application/json; charset=utf-8".toMediaType()
+        val imageBase64 = if (bitmap != null) {
+            withContext(Dispatchers.Default) { prepareBitmapBase64(bitmap) }
+        } else {
+            null
+        }
 
         var lastError: Exception? = null
 
         for ((modelIdx, modelId) in MODELS_FALLBACK.withIndex()) {
-            val maxModelAttempts = 2
-            for (attempt in 0 until maxModelAttempts) {
+            var useThinking = thinkingLevel != null && !modelId.contains("lite")
+            var attempt = 0
+            while (attempt < 2) {
+                attempt++
                 try {
-                    return withTimeout(60_000L) {
+                    val activeThinking = if (useThinking) thinkingLevel else null
+                    return withTimeout(timeoutMs) {
                         withContext(Dispatchers.IO) {
+                            val payload = buildRequestJson(
+                                prompt = prompt,
+                                precomputedBase64 = imageBase64,
+                                responseSchema = responseSchema,
+                                thinkingLevel = activeThinking
+                            ).toString()
                             val request = Request.Builder()
                                 .url("$BASE_URL/$modelId:generateContent")
                                 .addHeader("x-goog-api-key", apiKey)
@@ -166,15 +201,21 @@ class GeminiStudyRepository {
                     throw e
                 } catch (e: Exception) {
                     lastError = e
-                    Log.w(TAG, "Direct Gemini call ($modelId, attempt ${attempt + 1}) failed: ${e.message}")
-                    val nonRetryableForModel = e is HttpStatusException && e.statusCode in listOf(400, 401, 403, 404)
-                    val hasMoreAttempts = attempt < maxModelAttempts - 1 && !nonRetryableForModel
-                    val hasMoreModels = modelIdx < MODELS_FALLBACK.lastIndex
-                    if (hasMoreAttempts) {
+                    Log.w(TAG, "Direct Gemini call ($modelId, attempt $attempt) failed: ${e.message}")
+                    if (e is HttpStatusException && e.statusCode == 400 && useThinking) {
+                        useThinking = false
+                        attempt--
+                        continue
+                    }
+                    // Retry same model quickly ONLY on 429/503; fail fast on timeouts/other errors to next model.
+                    val transientRateOrBusy = e is HttpStatusException && e.statusCode in listOf(429, 503)
+                    if (transientRateOrBusy && attempt < 2) {
                         onRetrying?.invoke()
-                        delay(1200L)
-                    } else if (hasMoreModels) {
-                        onRetrying?.invoke()
+                        delay(450L)
+                    } else {
+                        if (modelIdx < MODELS_FALLBACK.lastIndex) {
+                            onRetrying?.invoke()
+                        }
                         break
                     }
                 }
@@ -246,6 +287,7 @@ class GeminiStudyRepository {
             appendLine("2) outsideConnections: links to real life, practical applications, or broader topics outside the lesson.")
             appendLine("3) importantQuestionsRadar: likely exam questions, tricky variations, and teacher alerts.")
             appendLine("4) mustMemorize: ONLY exact definitions, formulas, dates, or terms to memorize verbatim.")
+            appendLine("Keep each section crisp, high-impact, and scannable (4 to 7 focused bullet points per section) without unnecessary filler.")
             if (!lessonText.isNullOrBlank()) {
                 appendLine("\nLesson Text:\n$lessonText")
             }
@@ -271,6 +313,7 @@ class GeminiStudyRepository {
             prompt = prompt,
             bitmap = bitmap,
             responseSchema = schema,
+            thinkingLevel = if (cramMode) "minimal" else "low",
             onRetrying = onRetrying
         )
 
@@ -297,13 +340,14 @@ class GeminiStudyRepository {
             appendLine("\nStudent's Question:\n$studentQuestion")
         }
 
-        val payload = buildRequestJson(prompt).toString()
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val accumulated = StringBuilder()
 
         var streamed = false
         for (modelId in MODELS_FALLBACK) {
             try {
+                val thinking = if (modelId.contains("lite")) null else "minimal"
+                val payload = buildRequestJson(prompt = prompt, thinkingLevel = thinking).toString()
                 val request = Request.Builder()
                     .url("$BASE_URL/$modelId:streamGenerateContent?alt=sse")
                     .addHeader("x-goog-api-key", apiKey)
@@ -484,6 +528,7 @@ class GeminiStudyRepository {
             prompt = prompt,
             bitmap = bitmap,
             responseSchema = schema,
+            thinkingLevel = if (difficulty == ExamDifficulty.HARD) "low" else "minimal",
             onRetrying = onRetrying
         )
 
@@ -509,6 +554,23 @@ class GeminiStudyRepository {
         return questions
     }
 
+    private fun normalizeAnswerText(raw: String): String {
+        val cleaned = raw.trim().lowercase()
+            .replace('أ', 'ا')
+            .replace('إ', 'ا')
+            .replace('آ', 'ا')
+            .replace('ة', 'ه')
+            .replace('ى', 'ي')
+            .replace(Regex("[\\p{Punct}،؟]"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return when (cleaned) {
+            "صح", "صواب", "صحيح", "true", "t", "yes" -> "__TRUE__"
+            "غلط", "خطا", "false", "f", "no" -> "__FALSE__"
+            else -> cleaned
+        }
+    }
+
     suspend fun gradeExam(
         questions: List<ExamQuestion>,
         studentAnswers: Map<Int, String>,
@@ -517,80 +579,94 @@ class GeminiStudyRepository {
         onRetrying: () -> Unit = {}
     ): ExamGradingReport {
         val perQuestionMax = totalGrade.toDouble() / questions.size.coerceAtLeast(1)
+        val essayQuestions = questions.filter { it.type == "SHORT_ESSAY" }
 
-        val payload = JSONArray()
-        questions.forEach { q ->
-            payload.put(
-                JSONObject().apply {
-                    put("index", q.index)
-                    put("type", q.type)
-                    put("question", q.questionText)
-                    put("modelAnswer", q.correctAnswer)
-                    put("studentAnswer", studentAnswers[q.index].orEmpty().ifBlank { "(No answer)" })
-                }
-            )
-        }
+        val aiResultMap = mutableMapOf<Int, Triple<Boolean, Double, String>>()
+        var aiOverallNote = ""
 
-        val prompt = buildString {
-            appendLine(languageInstruction(lang))
-            appendLine("Grade each student answer fairly against the modelAnswer. For MCQ/TRUE_FALSE, exact/semantic match gets earnedRatio = 1.0, wrong gets 0.0. For SHORT_ESSAY, award partial credit (0.0 to 1.0) accurately and give encouraging teacher feedback.")
-            appendLine("\nQuestions and Answers:\n$payload")
-        }
+        if (essayQuestions.isNotEmpty()) {
+            val payload = JSONArray()
+            essayQuestions.forEach { q ->
+                payload.put(
+                    JSONObject().apply {
+                        put("index", q.index)
+                        put("type", q.type)
+                        put("question", q.questionText)
+                        put("modelAnswer", q.correctAnswer)
+                        put("studentAnswer", studentAnswers[q.index].orEmpty().ifBlank { "(No answer)" })
+                    }
+                )
+            }
 
-        val itemSchema = JSONObject()
-            .put("type", "OBJECT")
-            .put(
-                "properties",
-                JSONObject()
-                    .put("index", JSONObject().put("type", "INTEGER"))
-                    .put("isCorrect", JSONObject().put("type", "BOOLEAN"))
-                    .put("earnedRatio", JSONObject().put("type", "NUMBER"))
-                    .put("feedback", JSONObject().put("type", "STRING"))
-            )
-            .put("required", JSONArray(listOf("index", "isCorrect", "earnedRatio", "feedback")))
+            val prompt = buildString {
+                appendLine(languageInstruction(lang))
+                appendLine("Grade each short essay answer fairly against modelAnswer. Award earnedRatio (0.0 to 1.0) and give brief encouraging teacher feedback.")
+                appendLine("\nQuestions and Answers:\n$payload")
+            }
 
-        val schema = JSONObject()
-            .put("type", "OBJECT")
-            .put(
-                "properties",
-                JSONObject()
-                    .put("overallTeacherNote", JSONObject().put("type", "STRING"))
-                    .put(
-                        "items",
-                        JSONObject().put("type", "ARRAY").put("items", itemSchema)
-                    )
-            )
-            .put("required", JSONArray(listOf("overallTeacherNote", "items")))
+            val itemSchema = JSONObject()
+                .put("type", "OBJECT")
+                .put(
+                    "properties",
+                    JSONObject()
+                        .put("index", JSONObject().put("type", "INTEGER"))
+                        .put("isCorrect", JSONObject().put("type", "BOOLEAN"))
+                        .put("earnedRatio", JSONObject().put("type", "NUMBER"))
+                        .put("feedback", JSONObject().put("type", "STRING"))
+                )
+                .put("required", JSONArray(listOf("index", "isCorrect", "earnedRatio", "feedback")))
 
-        val raw = callGenerateContent(prompt = prompt, responseSchema = schema, onRetrying = onRetrying)
-        val root = JSONObject(raw)
-        val itemsArr = root.optJSONArray("items") ?: JSONArray()
-        val resultMap = mutableMapOf<Int, Triple<Boolean, Double, String>>()
-        for (i in 0 until itemsArr.length()) {
-            val obj = itemsArr.getJSONObject(i)
-            val idx = obj.optInt("index", i)
-            val ratio = obj.optDouble("earnedRatio", if (obj.optBoolean("isCorrect")) 1.0 else 0.0)
-                .coerceIn(0.0, 1.0)
-            val isCorrect = obj.optBoolean("isCorrect", ratio >= 0.7)
-            val fb = obj.optString("feedback")
-            resultMap[idx] = Triple(isCorrect, ratio, fb)
+            val schema = JSONObject()
+                .put("type", "OBJECT")
+                .put(
+                    "properties",
+                    JSONObject()
+                        .put("overallTeacherNote", JSONObject().put("type", "STRING"))
+                        .put(
+                            "items",
+                            JSONObject().put("type", "ARRAY").put("items", itemSchema)
+                        )
+                )
+                .put("required", JSONArray(listOf("overallTeacherNote", "items")))
+
+            val raw = callGenerateContent(prompt = prompt, responseSchema = schema, onRetrying = onRetrying)
+            val root = JSONObject(raw)
+            aiOverallNote = root.optString("overallTeacherNote")
+            val itemsArr = root.optJSONArray("items") ?: JSONArray()
+            for (i in 0 until itemsArr.length()) {
+                val obj = itemsArr.getJSONObject(i)
+                val idx = obj.optInt("index", essayQuestions.getOrNull(i)?.index ?: i)
+                val ratio = obj.optDouble("earnedRatio", if (obj.optBoolean("isCorrect")) 1.0 else 0.0)
+                    .coerceIn(0.0, 1.0)
+                val isCorrect = obj.optBoolean("isCorrect", ratio >= 0.7)
+                val fb = obj.optString("feedback")
+                aiResultMap[idx] = Triple(isCorrect, ratio, fb)
+            }
         }
 
         val gradedList = questions.map { q ->
             val studentAns = studentAnswers[q.index].orEmpty()
-            val entry = resultMap[q.index]
+            val aiEntry = aiResultMap[q.index]
             val isCorrect: Boolean
             val ratio: Double
             val fb: String
-            if (entry != null) {
-                isCorrect = entry.first
-                ratio = entry.second
-                fb = entry.third.ifBlank { q.explanation }
+            if (aiEntry != null) {
+                isCorrect = aiEntry.first
+                ratio = aiEntry.second
+                fb = aiEntry.third.ifBlank { q.explanation }
             } else {
-                val match = studentAns.trim().equals(q.correctAnswer.trim(), ignoreCase = true)
+                val normStudent = normalizeAnswerText(studentAns)
+                val normCorrect = normalizeAnswerText(q.correctAnswer)
+                val match = normStudent.isNotEmpty() && normStudent == normCorrect
                 isCorrect = match
                 ratio = if (match) 1.0 else 0.0
-                fb = q.explanation
+                fb = q.explanation.ifBlank {
+                    if (match) {
+                        if (lang == AppLanguage.AR) "إجابة ممتازة وصحيحة!" else "Spot on!"
+                    } else {
+                        if (lang == AppLanguage.AR) "راجع الإجابة الصحيحة وأضفها لبنك الأخطاء." else "Review the correct answer."
+                    }
+                }
             }
             GradedQuestionResult(
                 index = q.index,
@@ -604,10 +680,26 @@ class GeminiStudyRepository {
         }
 
         val totalEarned = (gradedList.sumOf { it.earnedPoints } * 10.0).roundToInt() / 10.0
+        val pct = if (totalGrade > 0) (totalEarned / totalGrade) * 100.0 else 0.0
+        val note = aiOverallNote.ifBlank {
+            if (lang == AppLanguage.AR) {
+                when {
+                    pct >= 85 -> "مستوى ممتاز يا بطل! استمر بنفس التركيز."
+                    pct >= 60 -> "أداء جيد جداً، راجع الأسئلة التي أخطأت فيها لتصل للدرجة النهائية."
+                    else -> "بداية طيبة، راجع الشرح وبنك الأخطاء وحاول مرة أخرى."
+                }
+            } else {
+                when {
+                    pct >= 85 -> "Outstanding work! Keep up this sharp focus."
+                    pct >= 60 -> "Solid effort! Review your missed items to reach a perfect score."
+                    else -> "Good practice! Review the breakdown and Mistake Bank, then retry."
+                }
+            }
+        }
         return ExamGradingReport(
             totalEarned = totalEarned.coerceAtMost(totalGrade.toDouble()),
             totalMax = totalGrade,
-            overallTeacherNote = root.optString("overallTeacherNote"),
+            overallTeacherNote = note,
             results = gradedList
         )
     }
@@ -713,7 +805,12 @@ class GeminiStudyRepository {
                 )
                 .put("required", JSONArray(listOf("orderedTips")))
 
-            val raw = callGenerateContent(prompt = prompt, responseSchema = schema, onRetrying = onRetrying)
+            val raw = callGenerateContent(
+                prompt = prompt,
+                responseSchema = schema,
+                timeoutMs = 7_500L,
+                onRetrying = onRetrying
+            )
             val arr = JSONObject(raw).optJSONArray("orderedTips") ?: JSONArray()
             val byName = subjects.associateBy { it.name.trim().lowercase() }
             for (i in 0 until arr.length()) {
